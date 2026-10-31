@@ -173,6 +173,7 @@ function p8c_run($root, $target)
         $report['engine'] = 'bitrix';
         p8c_bitrix_engine($report);
         p8c_bitrix_env($report);
+        p8c_db_version($report, p8c_bitrix_db_config($root));
         p8c_scan_dir($report, $root, $root, 'p8c_bitrix_area');
     } elseif (is_file($root . '/config.core.php')) {
         $report['engine'] = 'modx';
@@ -222,7 +223,7 @@ function p8c_bitrix_engine(&$report)
     } else {
         $report['engineNotes'][] = array('ok', 'Версия главного модуля ' . $ver . ' по нашим данным совместима с PHP ' . $report['target'] . '. Перед переходом всё равно установите все доступные обновления.');
     }
-    $report['engineNotes'][] = array('info', '1С-Битрикс ограничила поддержку своих продуктов на PHP ниже 8.1 (с 01.03.2024) и рекомендует PHP 8.2 и выше.');
+    $report['engineNotes'][] = array('info', 'По данным 1С-Битрикс: с 01.02.2026 поддержка продуктов на PHP ниже 8.2 ограничена, рекомендуется PHP 8.4 и выше; с 01.09.2026 - на MySQL ниже 8.0, рекомендуется MySQL 8.4 и выше. Порядок, который советует 1С-Битрикс: сначала обновить MySQL, затем продукт, затем PHP.');
 }
 
 /**
@@ -381,6 +382,7 @@ function p8c_modx_db(&$report, $core)
         $report['dbNote'] = 'Сниппеты и плагины из базы не проверены: не удалось прочитать настройки подключения.';
         return;
     }
+    p8c_db_version($report, $cfg);
     try {
         $pdo = new PDO($cfg['dsn'], $cfg['user'], $cfg['pass'], array(PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION));
         $pfx = $cfg['prefix'];
@@ -403,6 +405,78 @@ function p8c_modx_db(&$report, $core)
         }
     } catch (Exception $e) {
         $report['dbNote'] = 'Сниппеты и плагины из базы не проверены: не удалось подключиться к базе.';
+    }
+}
+
+/**
+ * Настройки подключения к базе из /bitrix/.settings.php.
+ *
+ * @param string $root
+ * @return array|null
+ */
+function p8c_bitrix_db_config($root)
+{
+    $file = $root . '/bitrix/.settings.php';
+    if (!is_file($file)) {
+        return null;
+    }
+    ob_start();
+    $cfg = @include $file;
+    ob_end_clean();
+    if (!is_array($cfg) || !isset($cfg['connections']['value']['default'])) {
+        return null;
+    }
+    $c = $cfg['connections']['value']['default'];
+    if (empty($c['login'])) {
+        return null;
+    }
+    $host = isset($c['host']) ? (string)$c['host'] : 'localhost';
+    $dsn = 'mysql:dbname=' . (isset($c['database']) ? $c['database'] : '');
+    if (preg_match('#^(.*?):(/.+)$#', $host, $m) || strpos($host, '/') === 0) {
+        $dsn .= ';unix_socket=' . (isset($m[2]) ? $m[2] : $host);
+    } elseif (preg_match('/^(.+):(\d+)$/', $host, $m)) {
+        $dsn .= ';host=' . $m[1] . ';port=' . $m[2];
+    } else {
+        $dsn .= ';host=' . $host;
+    }
+    return array('dsn' => $dsn, 'user' => $c['login'], 'pass' => isset($c['password']) ? $c['password'] : '', 'prefix' => '');
+}
+
+/**
+ * Версия MySQL/MariaDB: только читает VERSION(), ничего не меняет.
+ *
+ * @param array $report
+ * @param array|null $cfg
+ */
+function p8c_db_version(&$report, $cfg)
+{
+    if (!$cfg || !class_exists('PDO')) {
+        $report['env'][] = array('info', 'Версия базы данных не определена', 'Не удалось прочитать настройки подключения. Версию MySQL можно посмотреть в панели хостинга.');
+        return;
+    }
+    try {
+        $pdo = new PDO($cfg['dsn'], $cfg['user'], $cfg['pass'], array(PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5));
+        $ver = (string)$pdo->query('SELECT VERSION()')->fetchColumn();
+    } catch (Exception $e) {
+        $report['env'][] = array('info', 'Версия базы данных не определена', 'Не удалось подключиться к базе. Версию MySQL можно посмотреть в панели хостинга.');
+        return;
+    }
+    preg_match('/^(\d+\.\d+(\.\d+)?)/', $ver, $m);
+    $num = isset($m[1]) ? $m[1] : '0';
+    if (stripos($ver, 'mariadb') !== false) {
+        $report['env'][] = array('info', 'База данных: MariaDB ' . $num, 'Требования движка к версии MariaDB уточните в документации. При переходе на новую версию PHP база обычно не мешает, но её тоже стоит держать актуальной.');
+        return;
+    }
+    if ($report['engine'] === 'bitrix') {
+        if (version_compare($num, '8.0', '<')) {
+            $report['env'][] = array('warning', 'MySQL ' . $num, 'С 01.09.2026 1С-Битрикс ограничила поддержку продуктов на MySQL ниже 8.0 и рекомендует 8.4 и выше. По порядку 1С-Битрикс MySQL обновляют первым, до продукта и PHP. Обычно это делает поддержка хостинга.');
+        } elseif (version_compare($num, '8.4', '<')) {
+            $report['env'][] = array('info', 'MySQL ' . $num, 'Версия поддерживается. 1С-Битрикс рекомендует MySQL 8.4 и выше.');
+        } else {
+            $report['env'][] = array('ok', 'MySQL ' . $num, 'Версия соответствует рекомендации 1С-Битрикс.');
+        }
+    } else {
+        $report['env'][] = array('info', 'MySQL ' . $num, 'Версия базы данных для справки.');
     }
 }
 
